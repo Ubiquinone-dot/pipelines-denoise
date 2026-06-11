@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Denoise viewer — pixel-merge</title>
+<style>
+  :root{ --bg:#efe8db; --paper:#f6f1e7; --ink:#1a1712; --mut:#5d574d; --teal:#1c8273; --teal-bright:#136b5e; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; }
+  body{ background:var(--bg); color:var(--ink); font:14px/1.4 "Helvetica Neue",Helvetica,Arial,sans-serif; overflow:hidden; }
+  #c{ display:block; width:100%; height:100%; position:fixed; inset:0; }
+
+  #panel{ position:fixed; top:16px; right:16px; width:264px; background:var(--paper);
+    border:1px solid rgba(26,23,18,.12); border-radius:10px; padding:14px 16px;
+    box-shadow:0 6px 30px rgba(26,23,18,.10);
+    font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:12px; user-select:none; }
+  #panel h1{ font:600 11px/1.2 "IBM Plex Mono",monospace; letter-spacing:.12em; text-transform:uppercase; color:var(--mut); margin:0 0 12px; }
+  .row{ margin:10px 0; }
+  .row label{ display:flex; justify-content:space-between; color:var(--mut); margin-bottom:4px; }
+  .row label b{ color:var(--ink); font-weight:600; }
+  input[type=range]{ width:100%; accent-color:var(--teal); }
+  .btns{ display:flex; gap:6px; margin:12px 0 4px; }
+  button{ flex:1; cursor:pointer; font-family:inherit; font-size:12px; background:var(--teal); color:#fff; border:0; border-radius:6px; padding:7px 0; }
+  button.ghost{ background:transparent; color:var(--teal-bright); border:1px solid rgba(28,130,115,.4); }
+  .toggle{ display:flex; align-items:center; gap:8px; color:var(--mut); cursor:pointer; margin:7px 0; }
+  .toggle input{ accent-color:var(--teal); }
+  .hint{ color:var(--mut); opacity:.75; font-size:11px; margin-top:10px; line-height:1.5; }
+  #collapse{ position:absolute; top:12px; right:14px; cursor:pointer; color:var(--mut); background:none; border:0; width:auto; flex:none; padding:0; font-size:14px; }
+  #panel.min .body{ display:none; }
+  #stat{ position:fixed; left:16px; bottom:14px; font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--mut); opacity:.7; }
+</style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="stat"></div>
+
+  <div id="panel">
+    <button id="collapse" title="collapse">–</button>
+    <h1>Denoise · pixel-merge</h1>
+    <div class="body">
+      <div class="btns">
+        <button id="play">Pause</button>
+        <button id="restart" class="ghost">Restart</button>
+      </div>
+      <div class="row">
+        <label>progress <b id="pVal">0.00</b></label>
+        <input id="scrub" type="range" min="0" max="1" step="0.001" value="0" />
+      </div>
+      <div class="row">
+        <label>async / stagger <b id="asyncVal">0.50</b></label>
+        <input id="async" type="range" min="0" max="0.9" step="0.01" value="0.5" />
+      </div>
+      <div class="row">
+        <label>start emphasis <b id="emphVal">3.0</b></label>
+        <input id="emph" type="range" min="1" max="6" step="0.1" value="3" />
+      </div>
+      <div class="row">
+        <label>ease (start/end) <b id="easeVal">1.00</b></label>
+        <input id="ease" type="range" min="0" max="1" step="0.02" value="1" />
+      </div>
+      <div class="row">
+        <label>speed <b id="speedVal">0.18</b>/s</label>
+        <input id="speed" type="range" min="0.02" max="0.8" step="0.01" value="0.18" />
+      </div>
+      <div class="row">
+        <label>circle scale <b id="rsVal">1.00</b></label>
+        <input id="rs" type="range" min="0.5" max="2.0" step="0.05" value="1.0" />
+      </div>
+      <label class="toggle"><input id="tWhite" type="checkbox" /> white background</label>
+      <label class="toggle"><input id="tStroke" type="checkbox" /> circle outlines</label>
+      <p class="hint">Reverse pixel-merge, staggered left→right. async=0 → both denoise
+      together; higher → the right structure lags behind the left.</p>
+    </div>
+  </div>
+
+<script>
+// Structures render in a row, left→right. Order here = on-screen order.
+const DATASETS = [
+  { url:"data/0_dna_binder.pixels.json" },
+  { url:"data/1_nanocage_i3.pixels.json" },
+  { url:"data/2_hydrolase.pixels.json" },
+];
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let ST=[], progress=0, playing=true, lastT=0;       // ST = loaded structures
+let holdT=0; const HOLD=1.2;   // seconds to rest on the full image before looping
+// warp linear clock -> denoise progress: blend linear<->smoothstep (slow start/end)
+function warp(t){ const w=parseFloat(ui.ease.value); const s=t*t*(3-2*t); return t+(s-t)*w; }
+
+const ui={};
+["play","restart","scrub","pVal","async","asyncVal","emph","emphVal","ease","easeVal",
+ "speed","speedVal","rs","rsVal","tWhite","tStroke"].forEach(id=>ui[id]=document.getElementById(id));
+
+function lerp(a,b,t){ return a+(b-a)*t; }
+function clamp01(t){ return t<0?0:t>1?1:t; }
+function smoothstep(a,b,x){ const t=clamp01((x-a)/(b-a)); return t*t*(3-2*t); }
+function easeOutBack(t,k){ const c1=k, c3=c1+1; return 1+c3*Math.pow(t-1,3)+c1*Math.pow(t-1,2); }
+
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1,2);
+  cv.width=innerWidth*dpr; cv.height=innerHeight*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  computeViews();
+}
+function computeViews(){
+  const n=ST.length; if(!n) return;
+  const tileW=innerWidth/n, pad=0.08;
+  for(let k=0;k<n;k++){
+    const S=ST[k]; if(!S.D) continue;
+    const {w,h}=S.D.bounds;
+    const s=Math.min(tileW*(1-2*pad)/w, innerHeight*(1-2*pad)/h);
+    S.view={ s, ox: k*tileW + (tileW - s*w)/2, oy:(innerHeight - s*h)/2 };
+  }
+}
+
+function precompute(S){
+  const N=S.D.nodes, n=N.length;
+  S.parent=new Int32Array(n).fill(-1);
+  S.birth=new Float32Array(n);        // = parent.s, default 0 for roots
+  S.pdur=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const nd=N[i];
+    if(nd.ch){
+      for(const ci of nd.ch){ S.parent[ci]=i; S.birth[ci]=nd.s; S.pdur[ci]=nd.d||0.05; }
+    }
+  }
+}
+
+// per-structure local denoise progress from the master clock + stagger
+function localProgress(k){
+  const n=ST.length;
+  const A=parseFloat(ui.async.value);
+  const off = n>1 ? A*(k/(n-1)) : 0;           // structure 0 leads, last lags by A
+  const t = progress*(1+A);                    // timeline spans [0, 1+A]
+  return clamp01(t - off);
+}
+
+function drawStructure(S, prog){
+  const view=S.view; if(!view) return 0;
+  const X=x=>view.ox + x*view.s, Y=y=>view.oy + y*view.s, R=r=>r*view.s;
+  const p=warp(prog), rs=parseFloat(ui.rs.value);
+  // start emphasis: exponent on p stretches the coarse (early) splits over more
+  // of the timeline. split_at is linear in merge rank, so without this the big
+  // initial splits blow through a tiny slice of p near 0. q>1 exponent => slower start.
+  const emph=parseFloat(ui.emph.value);
+  const q = emph===1 ? p : Math.pow(p, emph);
+  const stroke=ui.tStroke.checked;
+  const N=S.D.nodes, birth=S.birth, parent=S.parent, pdur=S.pdur;
+  let drawn=0;
+  for(let i=0;i<N.length;i++){
+    const nd=N[i];
+    const b=birth[i];                 // frontier: born (q>=b) and not yet split
+    if(q < b) continue;
+    if(nd.ch && q >= nd.s) continue;  // internal node already split -> children draw it
+                                      // leaves (no ch) stay drawn through q=1 -> full image
+    let x=nd.x, y=nd.y, r=nd.r, a=1, R0=nd.c[0],G0=nd.c[1],B0=nd.c[2];
+    const par = parent[i];
+    if(par>=0){
+      const dur=pdur[i] || 0.05;
+      const e = clamp01((q-b)/dur);            // emergence 0..1
+      if(e<1){
+        const P=N[par];
+        const eS  = smoothstep(0,1,e);          // smooth position/radius/colour/alpha
+        x = lerp(P.x, nd.x, eS);
+        y = lerp(P.y, nd.y, eS);
+        const rStart = P.r*0.72;                // two children ~ cover parent
+        r = lerp(rStart, nd.r, eS);
+        R0 = lerp(P.c[0],nd.c[0],eS); G0=lerp(P.c[1],nd.c[1],eS); B0=lerp(P.c[2],nd.c[2],eS);
+        a = 0.25 + 0.75*eS;
+      }
+    }
+    let pr=R(r)*rs; if(pr<0.35) pr=0.35;
+    ctx.beginPath();
+    ctx.arc(X(x),Y(y),pr,0,6.2832);
+    ctx.fillStyle=`rgba(${R0|0},${G0|0},${B0|0},${a})`;
+    ctx.fill();
+    if(stroke){ ctx.lineWidth=0.6; ctx.strokeStyle=`rgba(255,255,255,${a*0.5})`; ctx.stroke(); }
+    drawn++;
+  }
+  return drawn;
+}
+
+function draw(){
+  ctx.clearRect(0,0,innerWidth,innerHeight);
+  if(!ST.length) return;
+  if(ui.tWhite.checked){ ctx.fillStyle="#ffffff"; ctx.fillRect(0,0,innerWidth,innerHeight); }
+  let total=0, parts=[];
+  for(let k=0;k<ST.length;k++){
+    if(!ST[k].D) continue;
+    const lp=localProgress(k);
+    total += drawStructure(ST[k], lp);
+    parts.push(`${ST[k].D.name} p=${warp(lp).toFixed(2)}`);
+  }
+  document.getElementById("stat").textContent=
+    `${parts.join("  ·  ")}  ·  ${total} circles`;
+}
+
+function tick(now){
+  if(!lastT) lastT=now;
+  const dt=(now-lastT)/1000; lastT=now;
+  if(playing && ST.length){
+    if(progress>=1){                       // resting on full image, then loop
+      holdT+=dt;
+      if(holdT>=HOLD){ progress=0; holdT=0; }
+    } else {
+      progress+=dt*parseFloat(ui.speed.value);
+      if(progress>=1){ progress=1; holdT=0; }
+    }
+    sync();
+  }
+  draw();
+  requestAnimationFrame(tick);
+}
+function sync(){ ui.scrub.value=progress; ui.pVal.textContent=progress.toFixed(2); }
+
+ui.play.onclick=()=>{ playing=!playing; ui.play.textContent=playing?"Pause":"Play"; if(playing&&progress>=1)progress=0; lastT=0; };
+ui.restart.onclick=()=>{ progress=0; holdT=0; playing=true; ui.play.textContent="Pause"; lastT=0; sync(); };
+ui.scrub.oninput=()=>{ progress=parseFloat(ui.scrub.value); playing=false; ui.play.textContent="Play"; ui.pVal.textContent=progress.toFixed(2); };
+const bind=(el,out,f)=>{ const g=()=>out.textContent=f(el.value); el.oninput=g; g(); };
+bind(ui.async,ui.asyncVal,v=>(+v).toFixed(2));
+bind(ui.emph,ui.emphVal,v=>(+v).toFixed(1));
+bind(ui.ease,ui.easeVal,v=>(+v).toFixed(2));
+bind(ui.speed,ui.speedVal,v=>(+v).toFixed(2));
+bind(ui.rs,ui.rsVal,v=>(+v).toFixed(2));
+document.getElementById("collapse").onclick=e=>{ const p=document.getElementById("panel"); p.classList.toggle("min"); e.target.textContent=p.classList.contains("min")?"+":"–"; };
+addEventListener("keydown",e=>{ if(e.code==="Space"){ e.preventDefault(); ui.play.click(); } });
+addEventListener("resize",resize);
+
+const CACHE_BUST = "?v=6";   // bump on every data regen so browsers/CDN refetch
+Promise.all(DATASETS.map(ds=>
+  fetch(ds.url+CACHE_BUST).then(r=>r.json()).then(D=>({D})).catch(err=>{ console.error(ds.url,err); return {D:null,err}; }))
+).then(list=>{
+  ST=list;
+  const ok=ST.filter(s=>s.D);
+  if(!ok.length){ document.body.insertAdjacentHTML("beforeend",
+     `<pre style="position:fixed;left:16px;top:16px;color:#c05549">Failed to load datasets. Serve over http.</pre>`); return; }
+  ok.forEach(precompute);
+  resize();
+  requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>
